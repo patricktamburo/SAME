@@ -1,3 +1,5 @@
+import lightkurve as lk
+import eleanor as el 
 from astroquery.gaia import Gaia
 Gaia.MAIN_GAIA_TABLE = 'gaiadr3.gaia_source'
 from astroquery.vizier import Vizier
@@ -145,7 +147,13 @@ def is_subset(tuple1, tuple2):
 
 def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, distance_threshold=4223, edge_threshold=30, same_chip=True, max_rp=16.5):
 	''' For a given Tierras field, identify stars that are similar types (Teff/logg), on the same chip, and are not variable in TESS'''
-	
+
+	# check for existing sources.csv output, if it exists then restore/return	
+	if os.path.exists('/home/ptamburo/tierras/pat_scripts/SAME/output/sources/sources.csv'):
+		print('Restoring sources.csv!')
+		stars = Table.from_pandas(pd.read_csv('/home/ptamburo/tierras/pat_scripts/SAME/output/sources/sources.csv'))
+		return stars
+
 	PLATE_SCALE = 0.432 
 	stacked_image_path = f'/data/tierras/targets/{field}/{field}_stacked_image.fits'
 	hdu = fits.open(stacked_image_path)
@@ -299,6 +307,33 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 
 	breakpoint()
 	return res
+
+def tess_variability_check(star):
+	''' check a target's TESS photometry to evaluate whether it should be retained as a SAME star or not'''
+
+	print(f"Doing Gaia DR3 {star['source_id']}")
+
+	# set up a SkyCoord object using the position/proper motion information from Gaia
+	ra_gaia = star['ra']
+	dec_gaia = star['dec']
+	epoch_gaia = star['ref_epoch']
+	pmra_gaia = star['pmra']
+	pmdec_gaia = star['pmdec']
+	sc_gaia = SkyCoord(ra_gaia*u.deg, dec_gaia*u.deg, pm_ra_cosdec=pmra_gaia*u.mas/u.yr, pm_dec=pmdec_gaia*u.mas/u.yr, obstime=Time(epoch_gaia, format='decimalyear'))
+
+	# el_star = el.multi_sectors(coords=sc_gaia, sectors='all')
+	el_star = el.Source(coords=sc_gaia)
+	el_data = el.TargetData(el_star, height=15, width=15, bkg_size=31, do_psf=False, do_pca=True)
+	qual_flags = el_data.quality == 0
+
+	plt.figure()
+	plt.plot(el_data.time[qual_flags], el_data.all_corr_flux[0][qual_flags])
+	breakpoint()
+	plt.close()
+	if np.std(el_data.all_corr_flux[0][qual_flags]) > 3*np.mean(el_data.flux_err):
+
+		breakpoint()
+	
 
 def star_selection(target, res, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, distance_threshold=4223, edge_threshold=30, same_chip=True, max_rp=16.5):
 	''' For a given Tierras field, identify stars that are similar types (Teff/logg), on the same chip, and are not variable in TESS'''
@@ -561,7 +596,11 @@ def star_selection(target, res, bp_rp_threshold=0.2, G_threshold=0.5, rp_thresho
 			arr = np.array(list(tup))
 			arr[np.where(arr == unique_same_stars[i])[0]] = i 
 			common_tuples[j] = tuple(list(arr))
-	breakpoint()	
+
+	# check tess data for the reference stars to toss any variables
+	for i in range(len(same_res)):
+		tess_variability_check(same_res[i])
+
 	return same_res, common_tuples, res
 
 def night_selection(field):
@@ -2009,19 +2048,22 @@ if __name__ == '__main__':
 	restore = True
 	bkg_type = '1d'
 	ap_radius = 12 
+	night_list = ['20240211', '20240213', '20240214', '20240215','20240216', '20240217', '20240219', '20240229', '20240301', '20240302', '20240303', '20240304']	
+	ap_radii = [5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
 
-	# either identify stars from Gaia or read in previous output
-	# stars = gaia_query(target_field)
-	stars = Table.from_pandas(pd.read_csv('/home/ptamburo/tierras/pat_scripts/SAME/output/sources/sources.csv'))
+	# identify sources in the field from Gaia
+	stars = gaia_query(target_field)
 
-	# # night_list = ['20240212', '20240213', '20240214', '20240215','20240216', '20240217', '20240219', '20240301', '20240302', '20240303']
-	# night_list = ['20240301', '20240302', '20240303']
-	# ap_radii = [5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
-	# for i in range(len(night_list)):
-	# 	print(f'Doing {night_list[i]}')
-	# 	files = get_flattened_files(night_list[i], target_field, 'flat0000')
-	# 	photometry(target_field, files, stars, ap_radii, an_in=35, an_out=55, centroid=True, bkg_type=bkg_type)
-	
+	# do photometry
+	for i in range(len(night_list)):
+		if os.path.exists(data_path+f'/photometry/{night_list[i]}'):
+			print(f'Photometry output already exists for {night_list[i]}, skipping!')
+		else:
+			print(f'Doing {night_list[i]}')
+			files = get_flattened_files(night_list[i], target_field, 'flat0000')
+			photometry(target_field, files, stars, ap_radii, an_in=35, an_out=55, centroid=True, bkg_type=bkg_type)
+
+	# either restore a previously defined cluster or use user-provided thresholds to define a new one
 	if restore:
 		ans = input('Enter cluster ID number (int): ')
 		cluster_ind = int(ans) 
