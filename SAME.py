@@ -1946,7 +1946,7 @@ def make_global_lists(cluster_ids, mainpath, ap_radius='optimal', bkg_type='1d')
 
 	return  output_dict
 
-def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_limit=1.4, fwhm_limit=2.5, sky_limit=2.0):
+def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_limit=1.4, fwhm_limit=2.5, sky_limit=2.0, flux_limit=0.8):
 
 	exposure_mask = np.zeros(len(data_dict['BJD']), dtype='bool')
 
@@ -1976,6 +1976,13 @@ def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_
 
 	# dome humidity
 	use_inds = np.where(data_dict['Dome Humidity'] > humidity_limit)[0]
+	exposure_mask[use_inds] = False
+
+	#raw flux
+	flux = data_dict['Flux']
+	norm_flux = (flux.T / np.median(flux, axis=1)).T
+	norm_flux_med = np.median(norm_flux, axis=0)
+	use_inds = np.where(norm_flux_med < flux_limit)[0]
 	exposure_mask[use_inds] = False
 
 	# update the dict with the exposure mask
@@ -2062,6 +2069,7 @@ if __name__ == '__main__':
 	fwhm_limit = 2.5
 	sky_limit = 2.0
 	position_limit = 2.5
+	flux_limit = 0.95 
 
 	# identify sources in the field from Gaia
 	stars = gaia_query(target_field)
@@ -2106,7 +2114,7 @@ if __name__ == '__main__':
 	phot_path = data_path + 'photometry'
 	global_list_dict = make_global_lists(cluster, phot_path, ap_radius=ap_radius, bkg_type=bkg_type)
 
-	global_list_dict = exposure_restrictor(global_list_dict, humidity_limit=humidity_limit, airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit)
+	global_list_dict = exposure_restrictor(global_list_dict, humidity_limit=humidity_limit, airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit, flux_limit = flux_limit)
 
 	corr_flux_dict = mearth_style_pat_weighted(global_list_dict) 
 
