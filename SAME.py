@@ -1261,15 +1261,15 @@ def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius,
 			sky_e = sky[jj][use_inds]*n_pix*GAIN*exptimes[use_inds]
 			rn_e = n_pix*READ_NOISE**2 
 			sigma_rel = np.sqrt(star_e + sky_e + rn_e)/star_e
-
+			
 			# calculate sigma_scint, expected relative uncertainty from scintillation 
 			sigma_scint = 1.5*np.sqrt(1+1/n_e)*0.09*DIAMETER**(-2/3)*airmass[use_inds]**(7/4)*(2*exptimes[use_inds])**(-1/2)*np.exp(-ELEVATION/8000)
 
 			# add these two uncertainties in quadrature to get the expected total uncertainty in each image 
 			sigma_tot = np.sqrt(sigma_rel**2 + sigma_scint**2)
 
-			error_on_mean_theory = np.sqrt(np.nansum(sigma_tot**2))/len(use_inds)
-
+			error_on_mean_theory = np.sqrt(np.nansum(sigma_tot**2))/len(np.where(~np.isnan(star_e))[0])
+			
 			binned_flux_err[jj,ii] = 1.2533*error_on_mean_theory # error on median should be ~25% larger than the theoretical error on the mean, according to the internet and Dave
 	
 			ax[0].plot(plot_times, flux_norm[jj][use_inds], marker='.', ls='' ,color=color, alpha=0.5, mec='none', zorder=0)
@@ -1468,15 +1468,21 @@ def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius,
 	ax.tick_params(labelsize=12)
 	plt.tight_layout()
 	plt.savefig(f'{output_dir}/cmd.png',dpi=200)
-
+	plt.ion()
+	
 	# make a distribution of z scores 
-	plt.figure()
-	plt.hist(np.ravel(z_scores))
+	plt.figure(figsize=(8,6))
+	weights = np.ones_like(np.ravel(z_scores))/len(np.ravel(z_scores))
+	counts, bins, _ = plt.hist(np.ravel(z_scores), weights=weights, label=f'Observed ($\mu$={np.mean(np.ravel(z_scores)):.2f}, $\sigma$={np.std(np.ravel(z_scores)):.2f})')
+	z_score_theory = np.random.normal(0,1,100000)
+	z_score_weights = np.ones_like(z_score_theory)/len(z_score_theory)
+	theory_counts, theory_bins, _ = plt.hist(np.random.normal(0,1,100000), weights=z_score_weights, bins=bins, histtype='step', lw=2, label='Theory ($\mu$=0, $\sigma$=1)')
 	plt.xlabel('Z score', fontsize=14)
 	plt.ylabel('N', fontsize=14)
+	plt.legend(loc='best')
 	plt.tight_layout()
 	plt.savefig(f'{output_dir}/zscores.png',dpi=200)
-	
+
 	plt.close('all')
 
 	plt.ion()	
@@ -1940,14 +1946,14 @@ def make_global_lists(cluster_ids, mainpath, ap_radius='optimal', bkg_type='1d')
 
 	return  output_dict
 
-def exposure_restrictor(data_dict, position_threshold=5):
+def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_limit=1.4, fwhm_limit=2.5, sky_limit=2.0):
 
 	exposure_mask = np.zeros(len(data_dict['BJD']), dtype='bool')
 
 	# positions
 	x_excursions = np.median((data_dict['X'].T-np.median(data_dict['X'],axis=1)).T,axis=0)
 	y_excursions = np.median((data_dict['Y'].T-np.median(data_dict['Y'],axis=1)).T,axis=0)
-	use_inds = np.where((abs(x_excursions)<position_threshold)&(abs(y_excursions)<position_threshold))[0]
+	use_inds = np.where((abs(x_excursions)<position_limit)&(abs(y_excursions)<position_limit))[0]
 	exposure_mask[use_inds] = True
 	
 	# hour angle 
@@ -1955,21 +1961,21 @@ def exposure_restrictor(data_dict, position_threshold=5):
 	exposure_mask[use_inds] = False
 
 	# airmass 
-	use_inds = np.where(data_dict['Airmass'] > 1.4)[0]
+	use_inds = np.where(data_dict['Airmass'] > airmass_limit)[0]
 	exposure_mask[use_inds] = False
 
 	# fwhm 
 	fwhm_x = np.median(data_dict['FWHM X'],axis=0)
-	use_inds = np.where(fwhm_x > 2.5)[0]
+	use_inds = np.where(fwhm_x > fwhm_limit)[0]
 	exposure_mask[use_inds] = False
 
 	# sky 
 	sky = np.median(data_dict['Sky'],axis=0)
-	use_inds = np.where(sky > 2.5)[0]
+	use_inds = np.where(sky > sky_limit)[0]
 	exposure_mask[use_inds] = False
 
 	# dome humidity
-	use_inds = np.where(data_dict['Dome Humidity'] > 60)[0]
+	use_inds = np.where(data_dict['Dome Humidity'] > humidity_limit)[0]
 	exposure_mask[use_inds] = False
 
 	# update the dict with the exposure mask
@@ -2047,9 +2053,15 @@ if __name__ == '__main__':
 	data_path = '/home/ptamburo/tierras/pat_scripts/SAME/output/'
 	restore = True
 	bkg_type = '1d'
-	ap_radius = 12 
-	night_list = ['20240211', '20240213', '20240214', '20240215','20240216', '20240217', '20240219', '20240229', '20240301', '20240302', '20240303', '20240304']	
+	ap_radius = 10
+	night_list = ['20240212', '20240213', '20240214', '20240215','20240216', '20240217', '20240219', '20240229', '20240301', '20240302', '20240303', '20240304']	
 	ap_radii = [5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+
+	humidity_limit = 30
+	airmass_limit = 1.4
+	fwhm_limit = 2.5
+	sky_limit = 2.0
+	position_limit = 2.5
 
 	# identify sources in the field from Gaia
 	stars = gaia_query(target_field)
@@ -2094,7 +2106,7 @@ if __name__ == '__main__':
 	phot_path = data_path + 'photometry'
 	global_list_dict = make_global_lists(cluster, phot_path, ap_radius=ap_radius, bkg_type=bkg_type)
 
-	global_list_dict = exposure_restrictor(global_list_dict)
+	global_list_dict = exposure_restrictor(global_list_dict, humidity_limit=humidity_limit, airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit)
 
 	corr_flux_dict = mearth_style_pat_weighted(global_list_dict) 
 
