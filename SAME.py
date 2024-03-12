@@ -6,6 +6,7 @@ from astroquery.vizier import Vizier
 from astroquery.simbad import Simbad
 from astroquery.sdss import SDSS
 from astropy.visualization import simple_norm, ZScaleInterval, ImageNormalize
+from astropy.modeling.functional_models import Gaussian2D
 import numpy as np 
 import matplotlib.pyplot as plt
 plt.ion()
@@ -21,7 +22,7 @@ from ap_phot import get_flattened_files, load_bad_pixel_mask, jd_utc_to_bjd_tdb,
 import os 
 import sep 
 import time
-from scipy.stats import sigmaclip
+from scipy.stats import sigmaclip, kstest
 from photutils.aperture import CircularAperture, EllipticalAperture, CircularAnnulus, aperture_photometry
 from photutils.background import Background2D, MedianBackground
 from pathlib import Path 
@@ -145,11 +146,11 @@ def is_subset(tuple1, tuple2):
     """Check if tuple1 is a subset of tuple2."""
     return all(elem in tuple2 for elem in tuple1)
 
-def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, distance_threshold=4223, edge_threshold=30, same_chip=True, max_rp=16.5):
+def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, distance_threshold=4223, edge_threshold=30, same_chip=True, max_rp=16.5, overwrite=False, contamination_limit = 0.001):
 	''' For a given Tierras field, identify stars that are similar types (Teff/logg), on the same chip, and are not variable in TESS'''
 
 	# check for existing sources.csv output, if it exists then restore/return	
-	if os.path.exists('/home/ptamburo/tierras/pat_scripts/SAME/output/sources/sources.csv'):
+	if (os.path.exists('/home/ptamburo/tierras/pat_scripts/SAME/output/sources/sources.csv')) and (not overwrite):
 		print('Restoring sources.csv!')
 		stars = Table.from_pandas(pd.read_csv('/home/ptamburo/tierras/pat_scripts/SAME/output/sources/sources.csv'))
 		return stars
@@ -171,11 +172,11 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 	#coord = SkyCoord(ra,dec,unit=(u.hourangle,u.degree),frame='icrs')
 	coord = SkyCoord(wcs.pixel_to_world(int(data.shape[1]/2),int(data.shape[0]/2)))
 	#width = u.Quantity(PLATE_SCALE*data.shape[0],u.arcsec)
-	width = 1500*u.arcsec
+	width = 1750*u.arcsec
 	height = u.Quantity(PLATE_SCALE*data.shape[1],u.arcsec)
 
 	job = Gaia.launch_job_async("""SELECT
-								source_id, ra, dec, ref_epoch, pmra, pmra_error, pmdec, pmdec_error, parallax, parallax_error, phot_bp_mean_mag, phot_g_mean_mag, phot_rp_mean_mag, bp_rp, phot_variable_flag, non_single_star,
+								source_id, ra, dec, ref_epoch, pmra, pmra_error, pmdec, pmdec_error, parallax, parallax_error, ruwe, phot_bp_mean_mag, phot_g_mean_mag, phot_rp_mean_mag, bp_rp, phot_variable_flag, non_single_star,
 									teff_gspphot, logg_gspphot, mh_gspphot, ag_gspphot,	ebpminrp_gspphot, 
 									r_med_geo, r_lo_geo, r_hi_geo,
 									r_med_photogeo, r_lo_photogeo, r_hi_photogeo,
@@ -186,20 +187,15 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 										SELECT * FROM gaiadr3.gaia_source as gaia
 
 										WHERE gaia.ra BETWEEN {} AND {} AND
-											  gaia.dec BETWEEN {} AND {} AND
-											  gaia.phot_rp_mean_mag <= 18 AND
-							 				  gaia.phot_variable_flag <> 'VARIABLE' AND
-							 				  gaia.non_single_star = 0
-
+											  gaia.dec BETWEEN {} AND {} 
 										OFFSET 0
 									) AS edr3
 									JOIN external.gaiaedr3_distance using(source_id)
-									WHERE ruwe<1.4 
 									ORDER BY phot_rp_mean_mag ASC
 								""".format(coord.ra.value-width.to(u.deg).value/2, coord.ra.value+width.to(u.deg).value/2, coord.dec.value-height.to(u.deg).value/2, coord.dec.value+height.to(u.deg).value/2)
 								)
 	res = job.get_results()
-
+	
 	#Cut to entries without masked pmra values; otherwise the crossmatch will break
 	problem_inds = np.where(res['pmra'].mask)[0]
 
@@ -208,10 +204,7 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 	res['pmdec'][problem_inds] = 0
 	res['parallax'][problem_inds] = 0
 
-	# #OPTION 2: Drop them from the table
-	# good_inds = np.where(~res['pmra'].mask)[0]
-	# res = res[good_inds]
-
+	# cross-match with 2MASS
 	gaia_coords = SkyCoord(ra=res['ra'], dec=res['dec'], pm_ra_cosdec=res['pmra'], pm_dec=res['pmdec'], obstime=Time('2016',format='decimalyear'))
 	v = Vizier(catalog="II/246",columns=['*','Date'], row_limit=-1)
 	twomass_res = v.query_region(coord, width=width, height=height)[0]
@@ -226,6 +219,7 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 	res['pmdec'][problem_inds] = np.nan
 	res['parallax'][problem_inds] = np.nan
 	
+	# calculate tierras pixel positions
 	tierras_pixel_coords = wcs.world_to_pixel(gaia_coords_tierras_epoch)
 
 	res.add_column(twomass_res['_2MASS'][idx_gaia],name='2MASS',index=1)
@@ -245,10 +239,14 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 	chip_inds = np.zeros(len(res),dtype='int')
 	chip_inds[np.where(res['Y pix'] >= 1023)] = 1
 	res.add_column(chip_inds, name='Chip')
-	
+
+	# save a copy of all the sources before we start cutting them 
+
 	#Cut to sources that actually fall in the image
 	use_inds = np.where((tierras_pixel_coords[0]>0)&(tierras_pixel_coords[0]<data.shape[1]-1)&(tierras_pixel_coords[1]>0)&(tierras_pixel_coords[1]<data.shape[0]-1))[0]
 	res = res[use_inds]
+	res_full = copy.deepcopy(res)	
+	print(f'Found {len(res)} sources in Gaia DR3!')
 
 	# remove sources near the bad columns 
 	bad_inds = np.where((res['Y pix'] < 1035) & (res['X pix'] > 1434) & (res['X pix'] < 1469))[0]
@@ -260,20 +258,74 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 	#Cut to sources that are away from the edges
 	use_inds = np.where((res['Y pix'] > edge_threshold) & (res['Y pix']<data.shape[0]-edge_threshold-1) & (res['X pix'] > edge_threshold) & (res['X pix'] < data.shape[1]-edge_threshold-1))[0]
 	res = res[use_inds]
-		
+	
+	# remove sources flagged as variable
+	use_inds =np.where(res['phot_variable_flag'] != 'VARIABLE')[0]
+	res = res[use_inds]
 
-	# remove sources that are within x pixels of any other source
-	dx = res['X pix'][:,np.newaxis]-res['X pix'][np.newaxis,:]
-	dy = res['Y pix'][:,np.newaxis]-res['Y pix'][np.newaxis,:]
-	distance_matrix = (dx**2+dy**2)**0.5
-	mask = np.tril(np.ones(distance_matrix.shape, dtype=bool), k=-1)
-	np.fill_diagonal(distance_matrix, np.nan)
-	distance_matrix[mask] = np.nan
-	bad_inds = np.unique(np.where(distance_matrix < 25))
-	res.remove_rows(bad_inds)
+	# remove sources flagged as non-single stars 
+	use_inds = np.where(res['non_single_star'] == 0)[0]
+	res = res[use_inds] 
 
+	# remove sources with high RUWE values 
+	use_inds = np.where(res['ruwe'] < 1.4)[0]
+	res = res[use_inds]
+
+	# remove faint sources 
+	use_inds = np.where(res['phot_rp_mean_mag'] < 18)[0]
+	res = res[use_inds]
+
+	print(f'{len(res)} sources remain after initial cuts')
+	
+	inds_to_remove = []
+	xx, yy = np.meshgrid(np.arange(-100, 100), np.arange(-100, 100)) # grid of pixels over which to simulate images
+	seeing_fwhm = 3/.432 #pix, assume 3" seeing
+	seeing_sigma = seeing_fwhm / (2*np.sqrt(2*np.log(2)))
+
+
+	for i in range(len(res)):
+		print(f'Estimating contamination for source {i+1} of {len(res)}')
+		distances = ((res['X pix'][i]-res_full['X pix'])**2 + (res['Y pix'][i]-res_full['Y pix'])**2)**0.5
+		nearby_inds = np.where(distances <= 100)[0]
+		nearby_inds = nearby_inds[np.where(distances[nearby_inds]!=0)[0]]
+		if len(nearby_inds) > 0:
+			source_rp = res['phot_rp_mean_mag'][i]
+			source_x = res['X pix'][i]
+			source_y = res['Y pix'][i]
+			nearby_rp = res_full['phot_rp_mean_mag'][nearby_inds]
+			nearby_x = res_full['X pix'][nearby_inds] - source_x
+			nearby_y = res_full['Y pix'][nearby_inds] - source_y 
+
+			# model the source in question as a 2D gaussian
+			source_model = Gaussian2D(x_mean=0, y_mean=0, amplitude=1/(2*np.pi*seeing_sigma**2), x_stddev=seeing_sigma, y_stddev=seeing_sigma)
+			sim_img = source_model(xx, yy)
+
+			# add in gaussian models for the nearby sources
+			for jj in range(len(nearby_rp)):
+				flux = 10**(-(nearby_rp[jj]-source_rp)/2.5)
+				contaminant_model = Gaussian2D(x_mean=nearby_x[jj], y_mean=nearby_y[jj], amplitude=flux/(2*np.pi*seeing_sigma**2), x_stddev=seeing_sigma, y_stddev=seeing_sigma)
+				contaminant = contaminant_model(xx,yy)
+				sim_img += contaminant
+			
+			# plt.figure()
+			# plt.imshow(sim_img, origin='lower', norm=simple_norm(sim_img, min_percent=1, max_percent=80))
+			
+			# estimate contamination by doing aperture photometry on the simulated image
+			# if the measured flux exceeds 1 by a chosen threshold, record the source's index so it can be removed
+			ap = CircularAperture((sim_img.shape[1]/2, sim_img.shape[0]/2), r=2*seeing_fwhm)
+			phot_table = aperture_photometry(sim_img, ap)
+			contamination = phot_table['aperture_sum'][0] - 1
+			if contamination > contamination_limit:
+				inds_to_remove.append([i])
+	res.remove_rows(inds_to_remove)
+
+	# ax.plot(res_full['X pix'], res_full['Y pix'], 'bx')
+	# ax.plot(res['X pix'], res['Y pix'], 'rx')
+	
+	print(f'{len(res)} sources remain after contamination cuts')	
+	
 	# remove non-main-sequence sources
-	upper_ms_bp_rp = np.arange(min(res['bp_rp']),max(res['bp_rp']),0.01) # create an estimate of the upper main sequence to exclude giants
+	upper_ms_bp_rp = np.arange(min(res_full['bp_rp']),max(res_full['bp_rp']),0.01) # create an estimate of the upper main sequence to exclude giants
 	upper_ms = 2.1 + 2.9*upper_ms_bp_rp # determined by-eye 
 	bad_inds = []
 	for i in range(len(res)):
@@ -282,8 +334,28 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 		if res['gq_photogeo'][i] < upper_ms[model_bp_rp_ind]:
 			bad_inds.append(i)
 	res.remove_rows(bad_inds)
+	print(f'{len(res)} sources remain after main sequence cuts')
 
 	ax.plot(res['X pix'], res['Y pix'], marker='x', ls='', color='tab:red')
+
+	fig1, ax1 = plt.subplots(1,2,figsize=(10,5)) 
+	ax1[0].scatter(res_full['bp_rp'],res_full['gq_photogeo'],alpha=0.4, color='#b0b0b0', marker='.')
+	ax1[0].scatter(res['bp_rp'],res['gq_photogeo'],alpha=0.4, color='tab:blue', marker='.')
+
+	ax1[0].invert_yaxis()
+	ax1[0].set_xlabel('B$_p$-R$_p$',fontsize=14)
+	ax1[0].set_ylabel('M$_{G}$',fontsize=14)
+	ax1[0].tick_params(labelsize=12)
+
+	ax1[1].scatter(res_full['bp_rp'],res_full['phot_rp_mean_mag'],alpha=0.4, color='#b0b0b0', marker='.')
+	ax1[1].scatter(res['bp_rp'],res['phot_rp_mean_mag'],alpha=0.4, color='tab:blue', marker='.')
+	ax1[1].invert_yaxis()
+	ax1[1].set_xlabel('B$_p$-R$_p$',fontsize=14)
+	ax1[1].set_ylabel('m$_{Rp}$',fontsize=14)
+	ax1[1].tick_params(labelsize=12)
+	plt.tight_layout()
+
+	ax1[0].plot(upper_ms_bp_rp, upper_ms, lw=1., ls='--', color='k')
 
 
 	df = res.to_pandas()
@@ -291,21 +363,6 @@ def gaia_query(field, bp_rp_threshold=0.2, G_threshold=0.5, rp_threshold=0.5, di
 
 	# create cmd 
 	
-	fig1, ax1 = plt.subplots(1,2,figsize=(10,7)) 
-	ax1[0].scatter(res['bp_rp'],res['gq_photogeo'],alpha=0.4, color='k', marker='.')
-	ax1[0].plot(upper_ms_bp_rp, upper_ms, lw=1.5)
-	ax1[0].invert_yaxis()
-	ax1[0].set_xlabel('B$_p$-R$_p$',fontsize=14)
-	ax1[0].set_ylabel('M$_{G}$',fontsize=14)
-	ax1[0].tick_params(labelsize=12)
-
-	ax1[1].scatter(res['bp_rp'],res['phot_rp_mean_mag'],alpha=0.4, color='k', marker='.')
-	ax1[1].invert_yaxis()
-	ax1[1].set_xlabel('B$_p$-R$_p$',fontsize=14)
-	ax1[1].set_ylabel('m$_{Rp}$',fontsize=14)
-	ax1[1].tick_params(labelsize=12)
-
-	breakpoint()
 	return res
 
 def tess_variability_check(star):
@@ -589,18 +646,17 @@ def star_selection(target, res, bp_rp_threshold=0.2, G_threshold=0.5, rp_thresho
 	same_res = res[unique_same_stars]
 	# same_res.add_column(same_cluster_ids, name='Cluster IDs')
 
-	# re-index the SAME stars to count from 0
-	for i in range(len(unique_same_stars)):
-		for j in range(len(common_tuples)):
-			tup = common_tuples[j]
-			arr = np.array(list(tup))
-			arr[np.where(arr == unique_same_stars[i])[0]] = i 
-			common_tuples[j] = tuple(list(arr))
+	# # re-index the SAME stars to count from 0
+	# for i in range(len(unique_same_stars)):
+	# 	for j in range(len(common_tuples)):
+	# 		tup = common_tuples[j]
+	# 		arr = np.array(list(tup))
+	# 		arr[np.where(arr == unique_same_stars[i])[0]] = i 
+	# 		common_tuples[j] = tuple(list(arr))
 
-	# check tess data for the reference stars to toss any variables
-	for i in range(len(same_res)):
-		tess_variability_check(same_res[i])
-
+	# # check tess data for the reference stars to toss any variables
+	# for i in range(len(same_res)):
+	# 	tess_variability_check(same_res[i])
 	return same_res, common_tuples, res
 
 def night_selection(field):
@@ -808,8 +864,8 @@ def photometry(target, file_list, sources, ap_radii, an_in, an_out, type='fixed'
 
 		#lunar_distance[i] = get_lunar_distance(RA, DEC, bjd_tdb[i]) #Commented out because this is slow and the information can be generated at a later point if necessary
 		
-		#Calculate expected scintillation noise in this image
-		scintillation_rel = 0.09*(130)**(-2/3)*airmasses[i]**(7/4)*(2*EXPTIME)**(-1/2)*np.exp(-2306/8000)
+		#Calculate expected scintillation noise in this image (see eqn. 2 in Juliana's SPIE paper) assuming all of the potential reference stars are uncorrelated 
+		scintillation_rel = 1.5 * np.sqrt(1 + 1/(len(sources)-1)) * 0.09*(130)**(-2/3)*airmasses[i]**(7/4)*(2*EXPTIME)**(-1/2)*np.exp(-2306/8000)
 
 		#UPDATE SOURCE POSITIONS
 		#METHOD 1: WCS
@@ -919,16 +975,17 @@ def photometry(target, file_list, sources, ap_radii, an_in, an_out, type='fixed'
 
 			# source_minus_sky_e[k,:,i] = source_minus_sky_ADU[k,:,i]*GAIN
 
-			#Calculation scintillation 
-			scintillation_abs_e = scintillation_rel * source_minus_sky_ADU[k,:,i]*GAIN
+			# convert scintillation noise from relative to absolutel by multiplying by source flux 
+			sigma_scint = scintillation_rel * source_minus_sky_ADU[k,:,i] * GAIN
 			
 			# Calculate uncertainty
-			source_minus_sky_err_e = np.sqrt(source_minus_sky_ADU[k,:,i]*GAIN+ source_sky_ADU[:,i]*ap_area*GAIN + DARK_CURRENT*EXPTIME*ap_area + ap_area*READ_NOISE**2 + scintillation_abs_e**2)
+			# source_minus_sky_err_e = np.sqrt(source_minus_sky_ADU[k,:,i]*GAIN+ source_sky_ADU[:,i]*ap_area*GAIN + DARK_CURRENT*EXPTIME*ap_area + ap_area*READ_NOISE**2 + scintillation_abs_e**2)
+			sigma_ccd = np.sqrt(source_minus_sky_ADU[k,:,i]*GAIN+ source_sky_ADU[:,i]*ap_area*GAIN + DARK_CURRENT*EXPTIME*ap_area + ap_area*READ_NOISE**2)
+
+			# estimate total error by adding noise from ccd photon counting and scintillation in quadrature (e.g. equation 1 of Juliana's SPIE paper) 
+			source_minus_sky_err_e = np.sqrt(sigma_ccd**2 + sigma_scint**2)
 			source_minus_sky_err_ADU[k,:,i] = source_minus_sky_err_e / GAIN
 
-			#Measure shape by fitting a 2D Gaussian to the cutout.
-			#Don't do for every aperture size, just do it once. 
-		
 		#Measure FWHM 
 		k = 0
 		t1 = time.time()
@@ -938,54 +995,7 @@ def photometry(target, file_list, sources, ap_radii, an_in, an_out, type='fixed'
 
 			#g_2d_cutout = copy.deepcopy(cutout)
 			g_2d_cutout, cutout_pos = generate_square_cutout(source_data, source_positions[j], 40)
-
-			# total_intensity = np.sum(g_2d_cutout)
-			# row_coords, col_coords = np.indices((g_2d_cutout.shape))
-			# centroid_row = np.sum(row_coords * g_2d_cutout) / total_intensity
-			# centroid_col = np.sum(col_coords * g_2d_cutout) / total_intensity
-			# centroid = np.array([centroid_col, centroid_row])
 			
-			# # calculate second-order moments 
-			# mu11 = np.sum((row_coords - centroid_row) * (col_coords - centroid_col) * g_2d_cutout) / total_intensity
-			# mu20 = np.sum((col_coords - centroid_col)**2 * g_2d_cutout) / total_intensity
-			# mu02 = np.sum((row_coords - centroid_row)**2 * g_2d_cutout) / total_intensity
-
-			# # calculate the major and minor axes 
-			# theta = 0.5 * np.arctan2(2*mu11, mu20-mu02)
-			# major_axis = np.sqrt(8 * (mu20 + mu02 + np.sqrt(4 * mu11**2 + (mu20 - mu02)**2)))
-			# minor_axis = np.sqrt(8 * (mu20 + mu02 - np.sqrt(4 * mu11**2 + (mu20 - mu02)**2)))
-
-			# num_points_major = int(round(major_axis))
-			# num_points_minor = int(round(minor_axis))
-
-			# major_axis_vector = np.array([np.cos(theta), np.sin(theta)]) * major_axis 
-			# minor_axis_vector = np.array([-np.sin(theta), np.cos(theta)]) * minor_axis
-
-			# major_axis_unit_vector = major_axis_vector / np.linalg.norm(major_axis_vector)
-			# minor_axis_unit_vector = minor_axis_vector / np.linalg.norm(minor_axis_vector)
-
-			# major_axis_distances = np.linspace(-0.5 * num_points_major, 0.5 * num_points_major, num_points_major)
-			# minor_axis_distances = np.linspace(-0.5 * num_points_minor, 0.5 * num_points_minor, num_points_minor)
-
-			# major_axis_points = centroid + np.outer(major_axis_distances, major_axis_unit_vector)
-			# minor_axis_points = centroid + np.outer(minor_axis_distances, minor_axis_unit_vector)
-
-			# major_axis_intensity = np.array([g_2d_cutout[int(round(pt[0])), int(round(pt[1]))] for pt in major_axis_points])
-			# minor_axis_intensity = np.array([g_2d_cutout[int(round(pt[0])), int(round(pt[1]))] for pt in minor_axis_points])
-
-			# major_axis_intensity_norm = major_axis_intensity / np.max(major_axis_intensity)
-			# minor_axis_intensity_norm = minor_axis_intensity / np.max(minor_axis_intensity)
-			
-			# # interpolate on to sub-pixel grid 
-			# f_major = interp1d(major_axis_distances, major_axis_intensity_norm)
-			# f_minor = interp1d(minor_axis_distances, minor_axis_intensity_norm) 
-
-			# x_new_major = np.arange(major_axis_distances[0], major_axis_distances[-1], 0.1)
-			# x_new_minor = np.arange(minor_axis_distances[0], minor_axis_distances[-1], 0.1)
-
-			# major_interp = f_major(x_new_major)
-			# minor_interp = f_minor(x_new_minor)
-			# breakpoint()
 			bkg = np.mean(sigmaclip(g_2d_cutout,2,2)[0])
 
 			xx2,yy2 = np.meshgrid(np.arange(g_2d_cutout.shape[1]),np.arange(g_2d_cutout.shape[0]))
@@ -1270,8 +1280,10 @@ def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius,
 
 			error_on_mean_theory = np.sqrt(np.nansum(sigma_tot**2))/len(np.where(~np.isnan(star_e))[0])
 			
-			binned_flux_err[jj,ii] = 1.2533*error_on_mean_theory # error on median should be ~25% larger than the theoretical error on the mean, according to the internet and Dave
-	
+			# binned_flux_err[jj,ii] = 1.2533*error_on_mean_theory # error on median should be ~25% larger than the theoretical error on the mean, according to the internet and Dave
+			
+			binned_flux_err[jj,ii] = np.sqrt(np.nansum(flux_corr_err_norm[0][use_inds]**2))/len(np.where(~np.isnan(star_e))[0]) * 1.2533 # alternative approach using the already-calculated theoretical errors, which should include photon noise (star and sky), read noise, dark current, scintillation, and noise from the zero-point correction
+
 			ax[0].plot(plot_times, flux_norm[jj][use_inds], marker='.', ls='' ,color=color, alpha=0.5, mec='none', zorder=0)
 			ax[1].plot(plot_times, flux_corr_norm[jj][use_inds], marker=marker, ls='' ,color=color, alpha=0.5, mec='none', zorder=0)
 			if ii == len(bjd_list)-1:
@@ -1473,12 +1485,14 @@ def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius,
 	# make a distribution of z scores 
 	plt.figure(figsize=(8,6))
 	weights = np.ones_like(np.ravel(z_scores))/len(np.ravel(z_scores))
-	counts, bins, _ = plt.hist(np.ravel(z_scores), weights=weights, label=f'Observed ($\mu$={np.mean(np.ravel(z_scores)):.2f}, $\sigma$={np.std(np.ravel(z_scores)):.2f})')
+	counts, bins, _ = plt.hist(np.ravel(z_scores), weights=weights, label=f'Observed ($\mu$={np.nanmean(np.ravel(z_scores)):.2f}, $\sigma$={np.nanstd(np.ravel(z_scores)):.2f})')
 	z_score_theory = np.random.normal(0,1,100000)
 	z_score_weights = np.ones_like(z_score_theory)/len(z_score_theory)
 	theory_counts, theory_bins, _ = plt.hist(np.random.normal(0,1,100000), weights=z_score_weights, bins=bins, histtype='step', lw=2, label='Theory ($\mu$=0, $\sigma$=1)')
 	plt.xlabel('Z score', fontsize=14)
-	plt.ylabel('N', fontsize=14)
+	plt.ylabel('PDF', fontsize=14)
+	ks_stat, ks_pval = kstest(np.sort(np.ravel(z_scores)), 'norm')
+	plt.title(f'K-S test p-value: {ks_pval:.5f}')
 	plt.legend(loc='best')
 	plt.tight_layout()
 	plt.savefig(f'{output_dir}/zscores.png',dpi=200)
@@ -1487,7 +1501,185 @@ def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius,
 
 	plt.ion()	
 	return fig, ax, binned_flux, binned_flux_err
+
+def mearth_style_pat_weighted_flux(data_dict):
+	""" Use the comparison stars to derive a frame-by-frame zero-point magnitude. Also filter and mask bad cadences """
+	""" it's called "mearth_style" because it's inspired by the mearth pipeline """
+	""" this version works with fluxes bc I hate the magnitude system with a burning passion"""
 	
+	bjds = data_dict['BJD']
+	flux = data_dict['Flux']
+	flux_err = data_dict['Flux Error']
+
+	# mask any cadences where the flux is negative for any of the sources 
+	mask = np.ones_like(bjds, dtype='bool')  # initialize a bad data mask
+	for i in range(len(flux)):
+		mask[np.where(flux[i] <= 0)[0]] = 0  
+
+	flux_corr_save = np.zeros_like(flux)
+	flux_err_corr_save = np.zeros_like(flux)
+	mask_save = np.zeros_like(flux)
+	weights_save = np.zeros((len(flux),len(flux)-1))
+
+	# loop over each star, calculate its zero-point correction using the other stars
+	for i in range(len(flux)):
+		# target_source_id = cluster_ids[i] # this represents the ID of the "target" *in the photometry files
+		regressor_inds = [j for j in np.arange(len(flux)) if i != j] # get the indices of the stars to use as the zero point calibrators; these represent the indices of the calibrators *in the data_dict arrays*
+		# regressor_source_ids = cluster_ids[regressor_inds] # these represent the IDs of the calibrators *in the photometry files*  
+
+		# grab target and source fluxes and apply initial mask 
+		target_flux = data_dict['Flux'][i]
+		target_flux_err = data_dict['Flux Error'][i]
+		regressors = data_dict['Flux'][regressor_inds]
+		regressors_err = data_dict['Flux Error'][regressor_inds]
+
+		target_flux[~mask] = np.nan 
+		target_flux_err[~mask] = np.nan 
+		for j in range(len(regressors)):
+			regressors[j][~mask] = np.nan 
+
+		tot_regressor = np.sum(regressors, axis=0)  # the total regressor flux at each time point = sum of comp star fluxes in each exposure
+		tot_regressor[~mask] = np.nan
+
+		# identify cadences with "low" flux by looking at normalized summed reference star fluxes
+		zp0s = tot_regressor/np.nanmedian(tot_regressor) 	
+		mask = np.ones_like(zp0s, dtype='bool')  # initialize another bad data mask
+		mask[np.where(zp0s < 0.8)[0]] = 0  # if regressor flux is decremented by 20% or more, this cadence is bad
+		target_flux[~mask] = np.nan 
+		target_flux_err[~mask] = np.nan 
+		for j in range(len(regressors)):
+			regressors[j][~mask] = np.nan 
+
+		# repeat the cs estimate now that we've masked out the bad cadences
+		# phot_regressor = np.nanpercentile(regressors, 90, axis=1)  # estimate photometric flux level for each star
+		norms = np.nanmedian(regressors, axis=1)
+		regressors_norm = regressors / norms[:, None]
+		regressors_err_norm = regressors_err / norms[:, None]
+
+		# mask out any exposures where any reference star is significantly discrepant 
+		mask = np.ones_like(target_flux, dtype='bool')
+		for j in range(len(regressors_norm)):
+			v, l, h = sigmaclip(regressors_norm[j][~np.isnan(regressors_norm[j])])
+			mask[np.where((regressors_norm[j] < l) | (regressors_norm[j] > h))[0]] = 0
+
+		target_flux[~mask] = np.nan 
+		target_flux_err[~mask] = np.nan 
+		for j in range(len(regressors)):
+			regressors[j][~mask] = np.nan 
+			regressors_err[j][~mask] = np.nan
+			regressors_norm[j][~mask] = np.nan
+			regressors_err_norm[j][~mask] = np.nan
+
+		# now calculate the weights for each regressor
+		# give all stars equal weights at first
+		weights_init = np.ones(len(regressors))/len(regressors)
+		
+		# calculate the initial zero point correction and its uncertaintiy 
+		zp = np.matmul(weights_init, regressors_norm) 
+		zp_err = np.sqrt(np.matmul(weights_init**2, regressors_err_norm**2)) # this represents the error on the weighted mean of all the regressors at each point 
+		
+		zp_init = copy.deepcopy(zp)
+		zp_err_init = copy.deepcopy(zp_err)
+		# plot the normalized regressor fluxes and the initial zero-point correction
+		for j in range(len(regressors)):
+			plt.plot(regressors_norm[j])
+		plt.errorbar(np.arange(len(zp)), zp, zp_err, color='k', zorder=4)
+
+		# do a 'crude' weighting loop to figure out which regressors, if any, should be totally discarded	
+		delta_weights = np.zeros(len(regressors))+999 # initialize
+		threshold = 1e-4 # delta_weights must converge to this value for the loop to stop
+		weights_old = weights_init
+		full_ref_inds = np.arange(len(regressors))
+		while len(np.where(delta_weights>threshold)[0]) > 0:
+			stddevs = np.zeros(len(regressors))		
+			
+			# loop over each regressor
+			for jj in range(len(regressors)):
+				# make its zeropoint correction using the flux of all the *other* regressors
+				use_inds = np.delete(full_ref_inds, jj)
+
+				# re-normalize the weights to sum to one
+				weights_wo_jj = weights_old[use_inds]
+				weights_wo_jj /= np.nansum(weights_wo_jj)
+				
+				# create a zeropoint correction using those weights 
+				zp_wo_jj = np.matmul(weights_wo_jj, regressors_norm[use_inds])
+
+				# correct the source's flux and re-normalize
+				corr_jj = regressors_norm[jj] / zp_wo_jj
+				corr_jj /= np.nanmedian(corr_jj)
+
+				# record the standard deviation of the corrected flux
+				stddevs[jj] = np.nanstd(corr_jj)
+
+			# update the weights using the measured standard deviations
+			weights_new = 1/stddevs**2
+			weights_new /= np.nansum(weights_new)
+			delta_weights = abs(weights_new-weights_old)
+			weights_old = weights_new
+
+		weights = weights_new
+
+		# determine if any references should be totally thrown out based on the ratio of their measured/expected noise
+		regressors_err_norm = (regressors_err.T / np.nanmedian(regressors,axis=1)).T
+		noise_ratios = stddevs / np.nanmedian(regressors_err_norm)      
+
+		# the noise ratio threshold will depend on how many bad/variable reference stars were used in the ALC
+		# sigmaclip the noise ratios and set the upper limit to the n-sigma upper bound 
+		v, l, h = sigmaclip(noise_ratios, 2, 2)
+
+		weights[np.where(noise_ratios>h)[0]] = 0
+		weights /= sum(weights)
+		
+		if len(np.where(weights == 0)[0]) > 0:
+			# now repeat the weighting loop with the bad refs removed 
+			delta_weights = np.zeros(len(regressors))+999 # initialize
+			threshold = 1e-6 # delta_weights must converge to this value for the loop to stop
+			weights_old = weights
+			full_ref_inds = np.arange(len(regressors))
+			count = 0
+			while len(np.where(delta_weights>threshold)[0]) > 0:
+				stddevs = np.zeros(len(regressors))
+
+				for jj in range(len(regressors)):
+					if weights_old[jj] == 0:
+						continue
+					use_inds = np.delete(full_ref_inds, jj)
+					weights_wo_jj = weights_old[use_inds]
+					weights_wo_jj /= np.nansum(weights_wo_jj)
+					zp_wo_jj = np.matmul(weights_wo_jj, regressors_norm[use_inds])	
+					
+					corr_jj = regressors[jj] / zp_wo_jj
+					corr_jj /= np.nanmean(corr_jj)
+					stddevs[jj] = np.nanstd(corr_jj)
+
+				weights_new = 1/(stddevs**2)
+				weights_new /= np.sum(weights_new[~np.isinf(weights_new)])
+				weights_new[np.isinf(weights_new)] = 0
+				delta_weights = abs(weights_new-weights_old)
+				weights_old = weights_new
+				count += 1
+
+		weights = weights_new
+
+		# calculate the zero-point correction
+		zp = np.matmul(weights, regressors_norm)
+		zp_err = np.sqrt(np.matmul(weights**2, regressors_err_norm**2)) # this represents the error on the weighted mean of all the regressors at each point 
+		
+		flux_corr = target_flux / zp  #cs, adjust the flux based on the calculated zero points
+		err_corr = np.sqrt((target_flux_err/zp)**2 + (target_flux*zp_err/(zp**2))**2)
+		mask_save[i] = ~np.isnan(flux_corr)
+		flux_corr_save[i] = flux_corr
+		flux_err_corr_save[i] = err_corr
+		weights_save[i] = weights
+
+	output_dict = copy.deepcopy(data_dict)
+	output_dict['ZP Mask'] = mask_save
+	output_dict['Corrected Flux'] = flux_corr_save
+	output_dict['Corrected Flux Error'] = flux_err_corr_save
+	output_dict['Weights'] = weights_save
+
+	return output_dict
 
 def mearth_style_pat_weighted(data_dict):
 	""" Use the comparison stars to derive a frame-by-frame zero-point magnitude. Also filter and mask bad cadences """
@@ -1646,6 +1838,13 @@ def mearth_style_pat_weighted(data_dict):
 		c_unc_best = np.nanmin(c_unc)
 		c_unc = np.sqrt(c_unc**2 - c_unc_best**2)
 
+		norm = np.nanmedian(regressors, axis=1)
+		reg_norm = (regressors.T/norm).T
+		reg_err_norm = (regressors_err.T/norm).T
+		# for j in range(len(cs)):
+		# 	plt.plot(10**(-cs[j]/2.5), marker='.')
+		# 	plt.plot(reg_norm)
+		# breakpoint()
 		cs = np.matmul(weights, cs)
 		
 		corrected_regressors = regressors * 10**(-cs/2.5)
@@ -1654,7 +1853,7 @@ def mearth_style_pat_weighted(data_dict):
 		err_corr = 10**(cs/(-2.5)) * np.sqrt(target_flux_err**2 + (c_unc*target_flux*np.log(10)/(-2.5))**2)  # propagate error
 
 		flux_corr = target_flux*10**(cs/(-2.5))  #cs, adjust the flux based on the calculated zero points
-			
+		# breakpoint()	
 		mask_save[i] = ~np.isnan(flux_corr)
 		flux_corr_save[i] = flux_corr
 		flux_err_corr_save[i] = err_corr
@@ -1695,7 +1894,7 @@ def return_dataframe_onedate_forapradius(mainpath,obsdate,ap_radius='optimal', b
 						return None
 				return df, lc_fname
 
-def make_global_lists(cluster_ids, mainpath, ap_radius='optimal', bkg_type='1d'):
+def make_global_lists(cluster_ids, mainpath, night_list=[], ap_radius='optimal', bkg_type='1d'):
 	# arrays to hold the full dataset
 	full_bjd = []
 	# full_flux = []
@@ -1745,8 +1944,12 @@ def make_global_lists(cluster_ids, mainpath, ap_radius='optimal', bkg_type='1d')
 
 	# array to hold individual nights
 	bjd_save = []
-	lcfolderlist = np.sort(glob(mainpath+f'/2**'))
-	lcdatelist = [lcfolderlist[ind].split("/")[-1] for ind in range(len(lcfolderlist))] 
+	if len(night_list) > 0:
+		lcdatelist = night_list
+		lcfolderlist = [mainpath+'/'+i for i in lcdatelist]
+	else:
+		lcfolderlist = np.sort(glob(mainpath+f'/2**'))
+		lcdatelist = [lcfolderlist[ind].split("/")[-1] for ind in range(len(lcfolderlist))] 
 	for ii,lcfolder in enumerate(lcfolderlist):
 		print("Processing", lcdatelist[ii])
 
@@ -1948,44 +2151,67 @@ def make_global_lists(cluster_ids, mainpath, ap_radius='optimal', bkg_type='1d')
 
 def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_limit=1.4, fwhm_limit=2.5, sky_limit=2.0, flux_limit=0.8):
 
-	exposure_mask = np.zeros(len(data_dict['BJD']), dtype='bool')
+	position_mask = np.zeros(len(data_dict['BJD']), dtype='bool')
+	ha_mask = np.zeros_like(position_mask)
+	fwhm_mask = np.zeros_like(position_mask)
+	airmass_mask = np.zeros_like(position_mask)
+	sky_mask = np.zeros_like(position_mask)
+	humidity_mask = np.zeros_like(position_mask) 
+	flux_mask = np.zeros_like(position_mask)
 
-	# positions
-	x_excursions = np.median((data_dict['X'].T-np.median(data_dict['X'],axis=1)).T,axis=0)
-	y_excursions = np.median((data_dict['Y'].T-np.median(data_dict['Y'],axis=1)).T,axis=0)
-	use_inds = np.where((abs(x_excursions)<position_limit)&(abs(y_excursions)<position_limit))[0]
-	exposure_mask[use_inds] = True
-	
+	# start by masking exposures that do not depend on source measurements (i.e., flux, pixel position, and fwhm)
+
 	# hour angle 
-	use_inds = np.where(data_dict['Hour Angle'] < 0)[0]
-	exposure_mask[use_inds] = False
+	use_inds = np.where(data_dict['Hour Angle'] > 0)[0]
+	# exposure_mask[use_inds] = False
+	ha_mask[use_inds] = True
 
 	# airmass 
-	use_inds = np.where(data_dict['Airmass'] > airmass_limit)[0]
-	exposure_mask[use_inds] = False
-
-	# fwhm 
-	fwhm_x = np.median(data_dict['FWHM X'],axis=0)
-	use_inds = np.where(fwhm_x > fwhm_limit)[0]
-	exposure_mask[use_inds] = False
+	use_inds = np.where(data_dict['Airmass'] < airmass_limit)[0]
+	# exposure_mask[use_inds] = False
+	airmass_mask[use_inds] = True
 
 	# sky 
 	sky = np.median(data_dict['Sky'],axis=0)
-	use_inds = np.where(sky > sky_limit)[0]
-	exposure_mask[use_inds] = False
+	use_inds = np.where(sky < sky_limit)[-1]
+	# exposure_mask[use_inds] = False
+	sky_mask[use_inds] = True
 
 	# dome humidity
-	use_inds = np.where(data_dict['Dome Humidity'] > humidity_limit)[0]
-	exposure_mask[use_inds] = False
+	use_inds = np.where(data_dict['Dome Humidity'] < humidity_limit)[0]
+	#exposure_mask[use_inds] = False
+	humidity_mask[use_inds] = True
+
+	exposure_mask = ha_mask & airmass_mask & sky_mask & humidity_mask
+	
+	# now add in masks on flux, positions, and fwhm, excluding the data that have already been masked
 
 	#raw flux
 	flux = data_dict['Flux']
-	norm_flux = (flux.T / np.median(flux, axis=1)).T
+	norm_flux = (flux.T / np.median(flux[:, exposure_mask], axis=1)).T
 	norm_flux_med = np.median(norm_flux, axis=0)
-	use_inds = np.where(norm_flux_med < flux_limit)[0]
-	exposure_mask[use_inds] = False
+	use_inds = np.where(norm_flux_med > flux_limit)[0]
+	#exposure_mask[use_inds] = True
+	flux_mask[use_inds] = True
+	
+	# positions
+	# x_excursions = np.median((data_dict['X'].T-np.median(data_dict['X'],axis=1)).T,axis=0)
+	x_excursions = np.median((data_dict['X'].T - np.median(data_dict['X'][:,exposure_mask],axis=1)).T, axis=0)
+	#y_excursions = np.median((data_dict['Y'].T-np.median(data_dict['Y'],axis=1)).T,axis=0)
+	y_excursions = np.median((data_dict['Y'].T - np.median(data_dict['Y'][:,exposure_mask],axis=1)).T, axis=0)
+	use_inds = np.where((abs(x_excursions)<position_limit)&(abs(y_excursions)<position_limit))[0]
+	# exposure_mask[use_inds] = True
+	position_mask[use_inds] = True
 
-	# update the dict with the exposure mask
+	# fwhm 
+	fwhm_x = np.median(data_dict['FWHM X'],axis=0)
+	use_inds = np.where(fwhm_x < fwhm_limit)[0]
+	# exposure_mask[use_inds] = False
+	fwhm_mask[use_inds] = True
+
+	# update the exposure mask to include the fwhm, position, and flux masks
+	exposure_mask = position_mask & ha_mask & airmass_mask & fwhm_mask & sky_mask & humidity_mask & flux_mask
+
 	output_dict = {}
 
 	#start by updating the BJD list 
@@ -1993,7 +2219,7 @@ def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_
 	for i in range(len(data_dict['BJD List'])):
 		use_inds = np.where((data_dict['BJD']>=data_dict['BJD List'][i][0])&(data_dict['BJD']<=data_dict['BJD List'][i][-1]))[0]
 		exposure_mask_night = exposure_mask[use_inds]
-		if sum(exposure_mask_night) != 0:
+		if sum(exposure_mask_night) > 1:
 			bjd_list.append(data_dict['BJD'][use_inds][exposure_mask_night])
 	flux = []
 	flux_err = []
@@ -2058,21 +2284,23 @@ if __name__ == '__main__':
 
 	target_field = 'LP119-26'
 	data_path = '/home/ptamburo/tierras/pat_scripts/SAME/output/'
-	restore = True
+	restore = False 
 	bkg_type = '1d'
 	ap_radius = 10
+	#night_list = ['20240212', '20240213', '20240214', '20240215', '20240216']	
 	night_list = ['20240212', '20240213', '20240214', '20240215','20240216', '20240217', '20240219', '20240229', '20240301', '20240302', '20240303', '20240304']	
+
 	ap_radii = [5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
 
 	humidity_limit = 30
 	airmass_limit = 1.4
 	fwhm_limit = 2.5
 	sky_limit = 2.0
-	position_limit = 2.5
-	flux_limit = 0.95 
+	position_limit = 2
+	flux_limit = 0.95
 
 	# identify sources in the field from Gaia
-	stars = gaia_query(target_field)
+	stars = gaia_query(target_field, overwrite=False)
 
 	# do photometry
 	for i in range(len(night_list)):
@@ -2095,28 +2323,32 @@ if __name__ == '__main__':
 		cluster = np.array(cluster)
 	else:
 		existing_clusters = [int(i) for i in os.listdir(data_path+'clusters/')]
-		cluster_ind = max(existing_clusters) + 1		
+		if len(existing_clusters) == 0:
+			cluster_ind = 0 
+		else:
+			cluster_ind = max(existing_clusters) + 1		
 
 		# search for groups of stars that meet the following thresholds between at least one pair of sources:
-		bp_rp_threshold = 1.5
+		bp_rp_threshold = 1.
 		G_threshold = 7
 		rp_threshold = 12
 		distance_threshold = 2000
 		max_rp = 17.75
 		same_stars, cluster, all_stars = star_selection(target_field, stars, bp_rp_threshold=bp_rp_threshold, G_threshold=G_threshold, distance_threshold=distance_threshold, max_rp=max_rp)
 		cluster = [i for i in cluster[0]]	
-	
+
+
 		# save a csv of the SAME stars
 		if not os.path.exists(data_path+f'clusters/{cluster_ind}'):
 			os.mkdir(data_path+f'clusters/{cluster_ind}')
 		same_df = same_stars.to_pandas().to_csv(data_path+f'clusters/{cluster_ind}/SAME_cluster.csv')
-	
+	breakpoint()
 	phot_path = data_path + 'photometry'
-	global_list_dict = make_global_lists(cluster, phot_path, ap_radius=ap_radius, bkg_type=bkg_type)
+	global_list_dict = make_global_lists(cluster, phot_path, night_list=night_list, ap_radius=ap_radius, bkg_type=bkg_type)
 
-	global_list_dict = exposure_restrictor(global_list_dict, humidity_limit=humidity_limit, airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit, flux_limit = flux_limit)
-
-	corr_flux_dict = mearth_style_pat_weighted(global_list_dict) 
+	global_list_dict = exposure_restrictor(global_list_dict, humidity_limit=humidity_limit, airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit, flux_limit=flux_limit)
+	corr_flux_dict = mearth_style_pat_weighted_flux(global_list_dict)
+	# corr_flux_dict = mearth_style_pat_weighted(global_list_dict) 
 
 	resfig, resax, binned_fluxes, binned_flux_errs = summary_plots(corr_flux_dict, cluster, cluster_ind, same_stars, stars, ap_radius, bkg_type=bkg_type) 
 
