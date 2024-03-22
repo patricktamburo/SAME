@@ -683,7 +683,7 @@ def photometry(target, file_list, sources, ap_radii, an_in, an_out, type='fixed'
 	date = file_list[0].parent.parent.parent.name 
 
 	#file_list = file_list[181:]
-	DARK_CURRENT = 0.19 #e- pix^-1 s^-1
+	DARK_CURRENT = 0.00133 #e- pix^-1 s^-1. see Juliana's dissertation Table 4.1
 	NONLINEAR_THRESHOLD = 40000. #ADU
 	SATURATION_THRESHOLD = 55000. #ADU
 	PLATE_SCALE = 0.43 #arcsec pix^-1, from Juliana's dissertation Table 1.1'
@@ -2284,7 +2284,7 @@ if __name__ == '__main__':
 
 	target_field = 'LP119-26'
 	data_path = '/home/ptamburo/tierras/pat_scripts/SAME/output/'
-	restore = False 
+	restore = True 
 	bkg_type = '1d'
 	ap_radius = 10
 	#night_list = ['20240212', '20240213', '20240214', '20240215', '20240216']	
@@ -2321,6 +2321,7 @@ if __name__ == '__main__':
 		for i in range(len(gaia_ids)):
 			cluster.append(np.where(stars['source_id'] == gaia_ids[i])[0][0])
 		cluster = np.array(cluster)
+		phot_path = data_path + 'photometry'
 	else:
 		existing_clusters = [int(i) for i in os.listdir(data_path+'clusters/')]
 		if len(existing_clusters) == 0:
@@ -2329,24 +2330,34 @@ if __name__ == '__main__':
 			cluster_ind = max(existing_clusters) + 1		
 
 		# search for groups of stars that meet the following thresholds between at least one pair of sources:
-		bp_rp_threshold = 1.
-		G_threshold = 7
+		bp_rp_threshold = 1.5
+		G_threshold = 3
 		rp_threshold = 12
-		distance_threshold = 2000
+		distance_threshold = 2500
 		max_rp = 17.75
 		same_stars, cluster, all_stars = star_selection(target_field, stars, bp_rp_threshold=bp_rp_threshold, G_threshold=G_threshold, distance_threshold=distance_threshold, max_rp=max_rp)
 		cluster = [i for i in cluster[0]]	
-
 
 		# save a csv of the SAME stars
 		if not os.path.exists(data_path+f'clusters/{cluster_ind}'):
 			os.mkdir(data_path+f'clusters/{cluster_ind}')
 		same_df = same_stars.to_pandas().to_csv(data_path+f'clusters/{cluster_ind}/SAME_cluster.csv')
-	breakpoint()
-	phot_path = data_path + 'photometry'
-	global_list_dict = make_global_lists(cluster, phot_path, night_list=night_list, ap_radius=ap_radius, bkg_type=bkg_type)
 
+		# save a .profile file containing the parameters that were used to create the cluster for record keeping
+		with open(data_path+f'clusters/{cluster_ind}/cluster_{cluster_ind}.profile', 'w') as f:
+			f.write(f'bp_rp_threshold = {bp_rp_threshold}\n')
+			f.write(f'G_threshold = {G_threshold}\n')
+			f.write(f'rp_threshold = {rp_threshold}\n')
+			f.write(f'distance_threshold = {distance_threshold}\n')
+			f.write(f'max_rp = {max_rp}')
+
+		phot_path = data_path + 'photometry'
+	global_list_dict = make_global_lists(cluster, phot_path, night_list=night_list, ap_radius=ap_radius, bkg_type=bkg_type)
+	
+	print(f'{len(global_list_dict["BJD"])} exposures before exposure_restrictor')
 	global_list_dict = exposure_restrictor(global_list_dict, humidity_limit=humidity_limit, airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit, flux_limit=flux_limit)
+	print(f'{len(global_list_dict["BJD"])} exposures after exposure_restrictor')
+
 	corr_flux_dict = mearth_style_pat_weighted_flux(global_list_dict)
 	# corr_flux_dict = mearth_style_pat_weighted(global_list_dict) 
 
