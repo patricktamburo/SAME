@@ -676,9 +676,6 @@ def night_selection(field):
 	breakpoint()
 	return
 
-def exposure_selection(field):
-	return 
-
 def photometry(target, file_list, sources, ap_radii, an_in, an_out, type='fixed', centroid=False, bkg_type='1d'):
 	date = file_list[0].parent.parent.parent.name 
 
@@ -1152,6 +1149,58 @@ def photometry(target, file_list, sources, ap_radii, an_in, an_out, type='fixed'
 	plt.close('all')
 	return 		
 
+def z_score_calculator(data_dict):
+	''' 
+		Caculate z scores of nightly medians for sources in a SAME data dictionary.
+
+		Parameters:
+		data_dict (dictionary): Dictionary containing corrected fluxes of sources generated with mearth_style.
+
+		Returns:
+		z_scores (array): array of z scores of nightly median fluxes for each source on each night
+	'''
+	t1 = time.time()
+	
+	GAIN = 5.9 # e- ADU^-1
+	
+	exptimes = data_dict['Exptime'] 
+	flux = data_dict['Flux']
+	flux_corr = data_dict['Corrected Flux']
+	flux_corr_err = data_dict['Corrected Flux Error']
+	zp_masks = data_dict['ZP Mask'].astype('bool')
+	bjd_list = data_dict['BJD List']
+	bjd = data_dict['BJD']
+
+	n_stars = len(flux_corr)
+	
+	# median normalize the raw fluxes 
+	norms2 = np.zeros(n_stars)
+	for i in range(n_stars):
+		flux_corr[i][~zp_masks[i]] = np.nan
+		flux_corr_err[i][~zp_masks[i]] = np.nan 
+		norms2[i] = np.nanmedian(flux_corr[i])
+
+	flux_corr_norm = (flux_corr.T/norms2).T
+	flux_corr_err_norm = (flux_corr_err.T/norms2).T
+	
+	# create arrays to store the median of the corrected flux for each source on each night 
+	binned_flux = np.zeros((n_stars, len(bjd_list)))
+	binned_flux_err = np.zeros_like(binned_flux)
+
+	for ii in range(len(bjd_list)):
+		try:
+			use_inds = np.where((bjd >= bjd_list[ii][0])&(bjd <= bjd_list[ii][-1]))[0]
+		except:
+			continue
+			
+		binned_flux[:,ii] = np.nanmedian(flux_corr_norm[:,use_inds],axis=1)
+		n_non_nan = sum(~np.isnan(flux_corr_norm[0,use_inds]))
+		binned_flux_err[:,ii] = (1.2533/n_non_nan) *np.sqrt(np.nansum(flux_corr_err_norm[:,use_inds]**2, axis=1))	
+		
+	z_scores = (binned_flux-1)/binned_flux_err
+
+	print(f'Z score time {time.time()-t1} s')
+	return z_scores
 
 def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius, bkg_type='1d'):
 	n_pix = np.pi*ap_radius**2
@@ -1581,9 +1630,9 @@ def mearth_style_pat_weighted_flux(data_dict):
 		zp_init = copy.deepcopy(zp)
 		zp_err_init = copy.deepcopy(zp_err)
 		# plot the normalized regressor fluxes and the initial zero-point correction
-		for j in range(len(regressors)):
-			plt.plot(regressors_norm[j])
-		plt.errorbar(np.arange(len(zp)), zp, zp_err, color='k', zorder=4)
+		# for j in range(len(regressors)):
+		# 	plt.plot(regressors_norm[j])
+		# plt.errorbar(np.arange(len(zp)), zp, zp_err, color='k', zorder=4)
 
 		# do a 'crude' weighting loop to figure out which regressors, if any, should be totally discarded	
 		delta_weights = np.zeros(len(regressors))+999 # initialize
@@ -2280,6 +2329,22 @@ def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_
 	
 	return output_dict
 
+def limit_generator():
+	'''
+		Generates random limits on exposure parameters. 
+
+		Inputs:
+			None
+		
+		Returns:
+			limit_dict (dict): dictionary where each entry is a tuple specifiying the lower/upper boundary on the parameter in question
+	'''
+
+	limit_dict = {}
+	limit_dict['humidity'] = tuple(np.sort(np.random.uniform(size=2)))
+
+	return limit_dict
+
 if __name__ == '__main__':
 
 	target_field = 'LP119-26'
@@ -2352,15 +2417,42 @@ if __name__ == '__main__':
 			f.write(f'max_rp = {max_rp}')
 
 		phot_path = data_path + 'photometry'
-	global_list_dict = make_global_lists(cluster, phot_path, night_list=night_list, ap_radius=ap_radius, bkg_type=bkg_type)
 	
-	print(f'{len(global_list_dict["BJD"])} exposures before exposure_restrictor')
-	global_list_dict = exposure_restrictor(global_list_dict, humidity_limit=humidity_limit, airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit, flux_limit=flux_limit)
-	print(f'{len(global_list_dict["BJD"])} exposures after exposure_restrictor')
+	# read in the photometry for this cluster
+	global_list_dict = make_global_lists(cluster, phot_path, night_list=night_list, ap_radius=ap_radius, bkg_type=bkg_type)
 
-	corr_flux_dict = mearth_style_pat_weighted_flux(global_list_dict)
-	# corr_flux_dict = mearth_style_pat_weighted(global_list_dict) 
+	n_loops = 10
 
-	resfig, resax, binned_fluxes, binned_flux_errs = summary_plots(corr_flux_dict, cluster, cluster_ind, same_stars, stars, ap_radius, bkg_type=bkg_type) 
+	loop_times = np.zeros(n_loops)
+	ks_stats = np.zeros(n_loops)
+	ks_pvals = np.zeros(n_loops)
+	humidity_los = np.zeros(n_loops)
+	humidity_his = np.zeros(n_loops)
+
+	for i in range(n_loops):
+		t1 = time.time()
+
+		if i > 0:
+			print(f'Avg loop time: {np.mean(loop_times[0:i+1])} s')
+		
+		# generate random retstrictions
+		humidity_los[i], humidity_his[i] = limit_generator()
+
+		# restrict to exposures based on limits 
+		restricted_dict = exposure_restrictor(global_list_dict, humidity_limit=(humidity_los[i], humidity_his[i]), airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit, flux_limit=flux_limit)
+
+		# do alc correction
+		corr_flux_dict = mearth_style_pat_weighted_flux(restricted_dict)
+
+		# caculate z scores of nightly medians
+		z_scores = z_score_calculator(corr_flux_dict)
+
+		# perform a k-s test between the measured z scores and the normal distribution
+		ks_stats[i], ks_pvals[i] = kstest(np.sort(np.ravel(z_scores)), 'norm')
+
+		loop_times[i] = time.time() - t1
+
+	breakpoint()
+	# resfig, resax, binned_fluxes, binned_flux_errs = summary_plots(corr_flux_dict, cluster, cluster_ind, same_stars, stars, ap_radius, bkg_type=bkg_type) 
 
 
