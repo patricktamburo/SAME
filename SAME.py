@@ -1696,7 +1696,7 @@ def mearth_style_pat_weighted_flux(data_dict):
 					weights_wo_jj /= np.nansum(weights_wo_jj)
 					zp_wo_jj = np.matmul(weights_wo_jj, regressors_norm[use_inds])	
 					
-					corr_jj = regressors[jj] / zp_wo_jj
+					corr_jj = regressors_norm[jj] / zp_wo_jj
 					corr_jj /= np.nanmean(corr_jj)
 					stddevs[jj] = np.nanstd(corr_jj)
 
