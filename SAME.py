@@ -1282,7 +1282,7 @@ def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius,
 			
 			# binned_flux_err[jj,ii] = 1.2533*error_on_mean_theory # error on median should be ~25% larger than the theoretical error on the mean, according to the internet and Dave
 			
-			binned_flux_err[jj,ii] = np.sqrt(np.nansum(flux_corr_err_norm[0][use_inds]**2))/len(np.where(~np.isnan(star_e))[0]) * 1.2533 # alternative approach using the already-calculated theoretical errors, which should include photon noise (star and sky), read noise, dark current, scintillation, and noise from the zero-point correction
+			binned_flux_err[jj,ii] = np.sqrt(np.nansum(flux_corr_err_norm[jj][use_inds]**2))/len(np.where(~np.isnan(star_e))[0]) * 1.2533 # alternative approach using the already-calculated theoretical errors, which should include photon noise (star and sky), read noise, dark current, scintillation, and noise from the zero-point correction
 
 			ax[0].plot(plot_times, flux_norm[jj][use_inds], marker='.', ls='' ,color=color, alpha=0.5, mec='none', zorder=0)
 			ax[1].plot(plot_times, flux_corr_norm[jj][use_inds], marker=marker, ls='' ,color=color, alpha=0.5, mec='none', zorder=0)
