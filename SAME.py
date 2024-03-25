@@ -1,4 +1,7 @@
 import lightkurve as lk
+import emcee
+import corner
+import warnings
 import eleanor as el 
 from astroquery.gaia import Gaia
 Gaia.MAIN_GAIA_TABLE = 'gaiadr3.gaia_source'
@@ -33,6 +36,7 @@ from photutils.centroids import centroid_sources, centroid_1dg, centroid_2dg, ce
 from astropy.stats import sigma_clipped_stats, SigmaClip
 from scipy.interpolate import interp1d 
 from astropy.table import Table 
+import logging 
 
 def circular_footprint(radius, dtype=int):
     """
@@ -1159,12 +1163,7 @@ def z_score_calculator(data_dict):
 		Returns:
 		z_scores (array): array of z scores of nightly median fluxes for each source on each night
 	'''
-	t1 = time.time()
-	
-	GAIN = 5.9 # e- ADU^-1
-	
-	exptimes = data_dict['Exptime'] 
-	flux = data_dict['Flux']
+			
 	flux_corr = data_dict['Corrected Flux']
 	flux_corr_err = data_dict['Corrected Flux Error']
 	zp_masks = data_dict['ZP Mask'].astype('bool')
@@ -1199,8 +1198,7 @@ def z_score_calculator(data_dict):
 		
 	z_scores = (binned_flux-1)/binned_flux_err
 
-	print(f'Z score time {time.time()-t1} s')
-	return z_scores
+	return z_scores, binned_flux, binned_flux_err
 
 def summary_plots(data_dict, complist, cluster_ind, stars, all_stars, ap_radius, bkg_type='1d'):
 	n_pix = np.pi*ap_radius**2
@@ -2198,7 +2196,7 @@ def make_global_lists(cluster_ids, mainpath, night_list=[], ap_radius='optimal',
 
 	return  output_dict
 
-def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_limit=1.4, fwhm_limit=2.5, sky_limit=2.0, flux_limit=0.8):
+def exposure_restrictor(data_dict, pos_hi, fwhm_hi, sky_hi, airmass_hi, flux_lo, dome_humidity_hi):
 
 	position_mask = np.zeros(len(data_dict['BJD']), dtype='bool')
 	ha_mask = np.zeros_like(position_mask)
@@ -2208,6 +2206,17 @@ def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_
 	humidity_mask = np.zeros_like(position_mask) 
 	flux_mask = np.zeros_like(position_mask)
 
+	# dome_humidity_lo = limit_dict['dome_humidity'][0]
+	# dome_humidity_hi = limit_dict['dome_humidity'][1]
+	# airmass_lo = limit_dict['airmass'][0]
+	# airmass_hi = limit_dict['airmass'][1]
+	# fwhm_lo = limit_dict['fwhm'][0]
+	# fwhm_hi = limit_dict['fwhm'][1]
+	# sky_lo = limit_dict['sky'][0]
+	# sky_hi = limit_dict['sky'][1]
+	# pos_lo = limit_dict['pos'][0]
+	# pos_hi = limit_dict['pos'][1]
+
 	# start by masking exposures that do not depend on source measurements (i.e., flux, pixel position, and fwhm)
 
 	# hour angle 
@@ -2216,19 +2225,16 @@ def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_
 	ha_mask[use_inds] = True
 
 	# airmass 
-	use_inds = np.where(data_dict['Airmass'] < airmass_limit)[0]
-	# exposure_mask[use_inds] = False
+	use_inds = np.where((data_dict['Airmass'] > 1) & (data_dict['Airmass'] < airmass_hi))[0]	
 	airmass_mask[use_inds] = True
 
 	# sky 
 	sky = np.median(data_dict['Sky'],axis=0)
-	use_inds = np.where(sky < sky_limit)[-1]
-	# exposure_mask[use_inds] = False
+	use_inds = np.where((sky > 0) & (sky  < sky_hi))[0]	
 	sky_mask[use_inds] = True
 
 	# dome humidity
-	use_inds = np.where(data_dict['Dome Humidity'] < humidity_limit)[0]
-	#exposure_mask[use_inds] = False
+	use_inds = np.where((data_dict['Dome Humidity'] > 0) & (data_dict['Dome Humidity'] < dome_humidity_hi))[0]
 	humidity_mask[use_inds] = True
 
 	exposure_mask = ha_mask & airmass_mask & sky_mask & humidity_mask
@@ -2239,23 +2245,22 @@ def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_
 	flux = data_dict['Flux']
 	norm_flux = (flux.T / np.median(flux[:, exposure_mask], axis=1)).T
 	norm_flux_med = np.median(norm_flux, axis=0)
-	use_inds = np.where(norm_flux_med > flux_limit)[0]
+	use_inds = np.where(norm_flux_med > flux_lo)[0]
 	#exposure_mask[use_inds] = True
 	flux_mask[use_inds] = True
 	
 	# positions
-	# x_excursions = np.median((data_dict['X'].T-np.median(data_dict['X'],axis=1)).T,axis=0)
-	x_excursions = np.median((data_dict['X'].T - np.median(data_dict['X'][:,exposure_mask],axis=1)).T, axis=0)
-	#y_excursions = np.median((data_dict['Y'].T-np.median(data_dict['Y'],axis=1)).T,axis=0)
-	y_excursions = np.median((data_dict['Y'].T - np.median(data_dict['Y'][:,exposure_mask],axis=1)).T, axis=0)
-	use_inds = np.where((abs(x_excursions)<position_limit)&(abs(y_excursions)<position_limit))[0]
-	# exposure_mask[use_inds] = True
+	x_excursions = abs(np.median((data_dict['X'].T - np.median(data_dict['X'][:,exposure_mask],axis=1)).T, axis=0))
+	y_excursions = (np.median((data_dict['Y'].T - np.median(data_dict['Y'][:,exposure_mask],axis=1)).T, axis=0))
+	use_inds = np.where((x_excursions>0)&
+					 	(x_excursions<pos_hi)&
+					    (y_excursions<0)& 
+						(y_excursions<pos_hi))[0]
 	position_mask[use_inds] = True
 
 	# fwhm 
 	fwhm_x = np.median(data_dict['FWHM X'],axis=0)
-	use_inds = np.where(fwhm_x < fwhm_limit)[0]
-	# exposure_mask[use_inds] = False
+	use_inds = np.where((fwhm_x > 0) & (fwhm_x < fwhm_hi))[0]
 	fwhm_mask[use_inds] = True
 
 	# update the exposure mask to include the fwhm, position, and flux masks
@@ -2329,21 +2334,77 @@ def exposure_restrictor(data_dict, position_limit=5, humidity_limit=60, airmass_
 	
 	return output_dict
 
-def limit_generator():
+def limit_generator(full_dict):
 	'''
 		Generates random limits on exposure parameters. 
 
 		Inputs:
-			None
-		
+			full_dict (dict): Dictionary from make_global_lists.
+
 		Returns:
-			limit_dict (dict): dictionary where each entry is a tuple specifiying the lower/upper boundary on the parameter in question
+			limit_dict (dict): Dictionary where each entry is a tuple specifiying the lower/upper boundary on the parameter in question.
 	'''
 
+	# set some boundaries based on the data actually contained in the full dictionary
+	# it doesn't make sense to apply limits that fall outside of the actual range of measured parameter values, that would just waste time
+	dome_humidity_lo = np.nanmin(full_dict['Dome Humidity'])
+	dome_humidity_hi = np.nanmax(full_dict['Dome Humidity'])
+	airmass_lo = np.nanmin(full_dict['Airmass'])
+	airmass_hi = np.nanmax(full_dict['Airmass'])
+	fwhm_lo = 1 # just set reasonable fwhm limits
+	fwhm_hi = 5
+	sky_lo = np.nanmin(np.nanmedian(full_dict['Sky'], axis=0))
+	sky_hi = np.nanmax(np.nanmedian(full_dict['Sky'], axis=0))
+	pos_lo = 0.5 # just set reasonable position limits
+	pos_hi = 10
+	
+	
 	limit_dict = {}
-	limit_dict['humidity'] = tuple(np.sort(np.random.uniform(size=2)))
-
+	limit_dict['dome_humidity'] = np.sort(np.random.uniform(low=dome_humidity_lo, high=dome_humidity_hi, size=2))
+	limit_dict['airmass'] = np.sort(np.random.uniform(low=airmass_lo, high=airmass_hi, size=2))
+	limit_dict['fwhm'] = np.sort(np.random.uniform(low=fwhm_lo, high=fwhm_hi, size=2))
+	limit_dict['sky'] = np.sort(np.random.uniform(low=sky_lo, high=sky_hi, size=2)) 
+	limit_dict['pos'] = np.sort(np.random.uniform(low=pos_lo, high=pos_hi, size=2))   
+	
+	limit_dict['dome_humidity'][0] = 0
+	limit_dict['airmass'][0] = 0 
+	limit_dict['fwhm'][0] = 0
+	limit_dict['sky'][0] = 0 
+	limit_dict['pos'][0] = 0
 	return limit_dict
+
+def log_likelihood(theta, x):
+	pos_hi, fwhm_hi, sky_hi, airmass_hi, flux_lo, dome_humidity_hi = theta 
+	restricted_dict = exposure_restrictor(x, pos_hi=pos_hi, fwhm_hi=fwhm_hi, sky_hi=sky_hi, airmass_hi=airmass_hi, flux_lo=flux_lo, dome_humidity_hi=dome_humidity_hi)
+	
+	if len(restricted_dict['BJD']) == 0:
+		return -np.inf
+	if len(restricted_dict['BJD List']) <= 1:
+		return -np.inf
+
+	z, y, yerr =  z_score_calculator(mearth_style_pat_weighted_flux(restricted_dict))
+	if z.shape[1] == 0:
+		return -np.inf
+
+	return -0.5 * np.sum((y-1)**2/yerr**2)
+
+def log_prior(theta):
+	pos_hi, fwhm_hi, sky_hi, airmass_hi, flux_lo, dome_humidity_hi = theta 
+	if (0 < pos_hi < 10) and (0 < fwhm_hi < 5) and (0 < sky_hi < 20) and (1 < airmass_hi < 1.6) and (0.8 < flux_lo < 1.0) and (0 < dome_humidity_hi < 100):
+		return 0
+
+	return -np.inf
+
+def log_probability(theta, x):
+	lp = log_prior(theta)
+	if not np.isfinite(lp):
+		return -np.inf
+	
+	prob = lp + log_likelihood(theta, x)
+	if np.isnan(prob):
+		return -np.inf 
+
+	return lp + log_likelihood(theta, x)
 
 if __name__ == '__main__':
 
@@ -2357,10 +2418,10 @@ if __name__ == '__main__':
 
 	ap_radii = [5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
 
-	humidity_limit = 30
-	airmass_limit = 1.4
-	fwhm_limit = 2.5
-	sky_limit = 2.0
+	# humidity_limit = 30
+	# airmass_limit = 1.4
+	# fwhm_limit = 2.5
+	# sky_limit = 2.0
 	position_limit = 2
 	flux_limit = 0.95
 
@@ -2417,42 +2478,127 @@ if __name__ == '__main__':
 			f.write(f'max_rp = {max_rp}')
 
 		phot_path = data_path + 'photometry'
-	
+
+	# set up logger
+	# anything at level DEBUG will be saved to the log file, while anything INFO or higher will be logged to the file and also printed to the console
+	log_path = Path(f'/home/ptamburo/tierras/pat_scripts/SAME/output/clusters/{cluster_ind}/cluster{cluster_ind}_SAME.log')
+	logger = logging.getLogger(__name__)
+	logger.setLevel(logging.DEBUG)
+	ch = logging.StreamHandler()
+	ch.setLevel(logging.INFO)
+	formatter = logging.Formatter('%(asctime)s - %(funcName)s - %(levelname)s - %(message)s')
+	ch.setFormatter(formatter)
+	logger.addHandler(ch)	
+	fh = logging.FileHandler(log_path, mode='w')
+	fh.setFormatter(formatter)
+	logger.addHandler(fh)
+
+	logger.info(f'Running SAME on cluster {cluster_ind}')
+	logger.info(f'Ap radius = {ap_radius}')
+
 	# read in the photometry for this cluster
 	global_list_dict = make_global_lists(cluster, phot_path, night_list=night_list, ap_radius=ap_radius, bkg_type=bkg_type)
 
-	n_loops = 10
 
-	loop_times = np.zeros(n_loops)
-	ks_stats = np.zeros(n_loops)
-	ks_pvals = np.zeros(n_loops)
-	humidity_los = np.zeros(n_loops)
-	humidity_his = np.zeros(n_loops)
+	nwalkers = 32
+	max_steps = 10000
+	x = global_list_dict
+	labels = ['pos_hi', 'fwhm_hi', 'sky_hi', 'airmass_hi', 'flux_lo', 'dome_humidity_hi']
 
-	for i in range(n_loops):
-		t1 = time.time()
+	# initialize walkers	
+	pos = []
+	for i in range(len(labels)):
+		if labels[i] == 'pos_hi':
+			pos.append(np.random.uniform(low=0, high=10, size=nwalkers))
+		if labels[i] == 'fwhm_hi':
+			pos.append(np.random.uniform(low=0, high=5, size=nwalkers))
+		if labels[i] == 'sky_hi':
+			pos.append(np.random.uniform(low=0, high=20, size=nwalkers))
+		if labels[i] == 'airmass_hi':
+			pos.append(np.random.uniform(low=1, high=1.6, size=nwalkers))
+		if labels[i] == 'flux_lo':
+			pos.append(np.random.uniform(low=0.8, high=1.0, size=nwalkers))	
+		if labels[i] == 'dome_humidity_hi':
+			pos.append(np.random.uniform(low=0, high=100, size=nwalkers))	
+	pos = np.array(pos).T
+	nwalkers, ndim = pos.shape 
 
-		if i > 0:
-			print(f'Avg loop time: {np.mean(loop_times[0:i+1])} s')
+	# Set up the backend
+	# Don't forget to clear it in case the file already exists
+	filename = f'/home/ptamburo/tierras/pat_scripts/SAME/output/clusters/{cluster_ind}/cluster{cluster_ind}_mcmc.h5'
+	backend = emcee.backends.HDFBackend(filename)
+	backend.reset(nwalkers, ndim)
+	
+	# initialize the sampler
+	# sampler = emcee.EnsembleSampler(nwalkers, ndim, log_probability, args=([x]))
+	sampler = emcee.EnsembleSampler(nwalkers, ndim, log_probability, args=([x]), backend=backend)
+	# sampler.run_mcmc(pos, nsteps, progress=True)
+
+	# track how avg autocorr time estimate changes 
+	index = 0 
+	autocorr = np.empty(max_steps)
+	old_tau = np.inf
+
+	corner_fig, corner_axes = plt.subplots(nrows=ndim, ncols=ndim, figsize=(10,10))
+	chain_fig, chain_axes = plt.subplots(ndim, figsize=(10,7), sharex=True)
+
+	for sample in sampler.sample(pos, iterations=max_steps, progress=True):
+		if sampler.iteration % 100:
+			continue
+		# compute the autocorrelation time so far 
+		# using tol=0 means we'll always get an estimate even if it isn't trustworthy 
+		tau = sampler.get_autocorr_time(tol=0)
+		autocorr[index] = np.mean(tau)
+		index += 1
+
+		# check convergence
+		converged = np.all(tau * 100 < sampler.iteration)
+		converged &= np.all(np.abs(old_tau -tau) /tau < 0.01)
+		if converged:
+			break
+		old_tau = tau 
+
+		# update plots 
+		if index > 1:
+			for a in chain_axes:
+				a.cla()
+			for a in corner_axes:
+				for b in a:
+					b.cla()
+
+		samples = sampler.get_chain()
+		flat_samples = sampler.get_chain(flat=True)
+		for i in range(ndim):
+			if ndim == 1:
+				ax = chain_axes
+			else:
+				ax = chain_axes[i]
+			ax.plot(samples[:,:,i], 'k', alpha=0.3)
+			ax.set_ylabel(labels[i])
+		ax.set_xlabel('step number')
+
+		corner.corner(flat_samples, labels=labels, fig=corner_fig)
 		
-		# generate random retstrictions
-		humidity_los[i], humidity_his[i] = limit_generator()
+		plt.pause(0.1)
+		
 
-		# restrict to exposures based on limits 
-		restricted_dict = exposure_restrictor(global_list_dict, humidity_limit=(humidity_los[i], humidity_his[i]), airmass_limit=airmass_limit, sky_limit=sky_limit, fwhm_limit=fwhm_limit, position_limit=position_limit, flux_limit=flux_limit)
+	samples = sampler.get_chain()
+	# chain plot 
+	fig, axes = plt.subplots(ndim, figsize=(10,7), sharex=True)
+	for i in range(ndim):
+		if ndim == 1:
+			ax = axes
+		else:
+			ax = axes[i]
+		ax.plot(samples[:,:,i], 'k', alpha=0.3)
+		ax.set_ylabel(labels[i])
+	ax[-1].set_xlabel('step number')
 
-		# do alc correction
-		corr_flux_dict = mearth_style_pat_weighted_flux(restricted_dict)
-
-		# caculate z scores of nightly medians
-		z_scores = z_score_calculator(corr_flux_dict)
-
-		# perform a k-s test between the measured z scores and the normal distribution
-		ks_stats[i], ks_pvals[i] = kstest(np.sort(np.ravel(z_scores)), 'norm')
-
-		loop_times[i] = time.time() - t1
-
+	# corner plot
+	flat_samples = sampler.get_chain(flat=True)
+	fig = corner.corner(flat_samples, labels=labels)
 	breakpoint()
-	# resfig, resax, binned_fluxes, binned_flux_errs = summary_plots(corr_flux_dict, cluster, cluster_ind, same_stars, stars, ap_radius, bkg_type=bkg_type) 
+
+	
 
 
